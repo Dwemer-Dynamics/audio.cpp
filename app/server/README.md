@@ -223,7 +223,7 @@ Relative `voice_dir` paths resolve against the config file's directory. When a r
 
 Resolution precedence for a TTS request's voice fields:
 
-1. `voice_ref` — always wins.
+1. `voice_ref` — always wins. Accepts a server path string, `{"type":"path","path":"..."}`, or `{"type":"base64","data":"<padded base64 WAV>"}` for a client-side reference (optional `data:audio/wav;base64,` prefix). Inline WAVs are decoded in memory only, capped at 5 MiB decoded, and still subject to `max_request_body_bytes`.
 2. `voice` matching a configured model preset — preset wins.
 3. `voice` matching a wav basename in `voice_dir` — voice-library clone.
 4. Otherwise — `voice` is used as the model-native cached voice id (previous behavior).

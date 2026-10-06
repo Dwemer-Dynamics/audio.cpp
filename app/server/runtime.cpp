@@ -326,6 +326,85 @@ std::string base64_encode(const std::vector<std::byte> & bytes) {
     return base64_encode(reinterpret_cast<const uint8_t *>(bytes.data()), bytes.size());
 }
 
+// Inline voice_ref audio is capped so a request cannot force a large decode
+// plus float expansion; the encoded bound adds slack for a data URI prefix and
+// line breaks and is checked before any decoding work.
+constexpr size_t kMaxInlineVoiceRefBytes = size_t{5} * 1024 * 1024;
+constexpr size_t kMaxInlineVoiceRefBase64Length = ((kMaxInlineVoiceRefBytes + 2) / 3) * 4 + 4096;
+
+// Strict padded standard-alphabet base64 decoder for inline voice_ref audio.
+// Accepts an optional "data:<mime>;base64," prefix and ASCII whitespace.
+// Error messages never echo the payload.
+std::string decode_inline_voice_ref_base64(std::string_view input) {
+    if (input.size() > kMaxInlineVoiceRefBase64Length) {
+        throw std::runtime_error("voice_ref base64 data exceeds the 5 MiB limit");
+    }
+    if (input.rfind("data:", 0) == 0) {
+        const auto comma = input.find(',');
+        if (comma == std::string_view::npos || input.substr(0, comma).find(";base64") == std::string_view::npos) {
+            throw std::runtime_error("voice_ref base64 data URI is malformed");
+        }
+        input.remove_prefix(comma + 1);
+    }
+
+    std::string out;
+    out.reserve(std::min(kMaxInlineVoiceRefBytes, (input.size() / 4) * 3));
+    uint32_t buffer = 0;
+    int bits = 0;
+    size_t symbols = 0;
+    size_t padding = 0;
+    for (const char c : input) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            continue;
+        }
+        ++symbols;
+        if (c == '=') {
+            ++padding;
+            continue;
+        }
+        if (padding > 0) {
+            throw std::runtime_error("voice_ref base64 data has characters after padding");
+        }
+        int value = -1;
+        if (c >= 'A' && c <= 'Z') {
+            value = c - 'A';
+        } else if (c >= 'a' && c <= 'z') {
+            value = c - 'a' + 26;
+        } else if (c >= '0' && c <= '9') {
+            value = c - '0' + 52;
+        } else if (c == '+') {
+            value = 62;
+        } else if (c == '/') {
+            value = 63;
+        } else {
+            throw std::runtime_error("voice_ref base64 data contains an invalid character");
+        }
+        buffer = (buffer << 6) | static_cast<uint32_t>(value);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (out.size() >= kMaxInlineVoiceRefBytes) {
+                throw std::runtime_error("voice_ref base64 data exceeds the 5 MiB limit");
+            }
+            out.push_back(static_cast<char>((buffer >> bits) & 0xff));
+        }
+    }
+    if (symbols == 0) {
+        throw std::runtime_error("voice_ref base64 data is empty");
+    }
+    if (symbols % 4 != 0 || padding > 2) {
+        throw std::runtime_error("voice_ref base64 data is truncated or has invalid padding");
+    }
+    // Padding must exactly cover the leftover bits of the final quartet.
+    if ((padding == 0 && bits != 0) || (padding == 1 && bits != 2) || (padding == 2 && bits != 4)) {
+        throw std::runtime_error("voice_ref base64 data has invalid padding");
+    }
+    if (out.empty()) {
+        throw std::runtime_error("voice_ref base64 data decoded to an empty payload");
+    }
+    return out;
+}
+
 void write_sse(HttpStreamWriter & writer, const std::string & json) {
     writer.write("data: " + json + "\n\n");
 }
@@ -1641,7 +1720,25 @@ engine::runtime::TaskRequest ServerState::build_speech_request(const LoadedModel
         if (!voice.speaker.has_value()) {
             voice.speaker = engine::runtime::VoiceReference{};
         }
-        voice.speaker->audio = minitts::cli::read_audio_buffer(resolve_path(request_base_, value->as_string()));
+        // voice_ref is a server path string, {"type":"path","path":...}, or
+        // {"type":"base64","data":...} carrying a client-side WAV that is decoded
+        // in memory only (never written to disk).
+        if (value->is_string()) {
+            voice.speaker->audio = minitts::cli::read_audio_buffer(resolve_path(request_base_, value->as_string()));
+        } else if (value->is_object()) {
+            const auto & type = engine::io::json::require_string(*value, "type");
+            if (type == "path") {
+                voice.speaker->audio = minitts::cli::read_audio_buffer(
+                    resolve_path(request_base_, engine::io::json::require_string(*value, "path")));
+            } else if (type == "base64") {
+                const auto bytes = decode_inline_voice_ref_base64(engine::io::json::require_string(*value, "data"));
+                voice.speaker->audio = minitts::cli::read_audio_buffer(std::string_view(bytes));
+            } else {
+                throw std::runtime_error("voice_ref type must be \"path\" or \"base64\"");
+            }
+        } else {
+            throw std::runtime_error("voice_ref must be a path string or an object with type \"path\" or \"base64\"");
+        }
         has_voice = true;
     }
     if (const auto * value = body.find("reference_text")) {
